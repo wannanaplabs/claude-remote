@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<title>Claude Remote</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #15181d;
+    --panel2: #1c2026;
+    --border: #262a31;
+    --fg: #e6e6e6;
+    --muted: #8a93a0;
+    --accent: #d97757;
+    --danger: #e05555;
+    --good: #4ea67a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    overscroll-behavior: none;
+  }
+  /* Use dynamic viewport units so iOS's soft keyboard shrinks the layout
+     instead of pushing our input bar off-screen under the keyboard. */
+  body { display: flex; flex-direction: column; height: 100dvh; min-height: 0; }
+
+  header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    padding-top: calc(10px + env(safe-area-inset-top));
+  }
+  header .title { font-weight: 600; font-size: 15px; flex: 1; }
+  header button, .pill {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font-size: 13px; cursor: pointer;
+  }
+  header button:active { background: #2a2f37; }
+  #reconnectBtn { font-size: 16px; padding: 4px 10px; line-height: 1; }
+
+  /* Session picker drawer */
+  #drawer {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    display: none; z-index: 10;
+  }
+  #drawer.open { display: block; }
+  #drawer .sheet {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    background: var(--panel); border-top: 1px solid var(--border);
+    border-radius: 14px 14px 0 0; max-height: 85dvh; overflow: auto;
+    padding: 10px 12px calc(16px + env(safe-area-inset-bottom));
+  }
+  #drawer h2 { margin: 8px 2px 10px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .session-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 10px; border: 1px solid var(--border);
+    border-radius: 10px; margin-bottom: 8px; background: var(--panel2);
+  }
+  .session-row .name { flex: 1; font-weight: 600; }
+  .session-row .cwd { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
+  .session-row .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .session-row .dot.live { background: var(--good); }
+  .session-row .kill {
+    background: transparent; border: 1px solid var(--border);
+    color: var(--danger); border-radius: 8px; padding: 4px 8px; font-size: 12px;
+  }
+
+  /* New-session form */
+  .newbox { border: 1px solid var(--border); border-radius: 10px; padding: 10px; background: var(--panel2); }
+  .newbox label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .newbox input {
+    width: 100%; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; font-size: 14px; margin-bottom: 8px;
+    font-family: ui-monospace, monospace;
+  }
+  .newbox button {
+    width: 100%; background: var(--accent); color: #111;
+    border: 0; border-radius: 8px; padding: 10px;
+    font-weight: 600; font-size: 14px;
+  }
+
+  /* Terminal */
+  #term-wrap {
+    flex: 1; min-height: 0; background: #000;
+    padding: 6px; overflow: hidden; position: relative;
+    touch-action: none; /* we handle touch scroll manually */
+  }
+  #term { width: 100%; height: 100%; }
+  /* Floating jump-to-bottom pill, shows when user has scrolled up */
+  #jumpBottom {
+    position: absolute; right: 10px; bottom: 10px;
+    background: var(--accent); color: #111; border: 0;
+    border-radius: 999px; padding: 8px 12px; font-size: 13px; font-weight: 600;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    display: none; z-index: 5;
+  }
+  #jumpBottom.show { display: block; }
+
+  /* Quick actions + input bar */
+  #qbar {
+    display: flex; gap: 6px; overflow-x: auto;
+    padding: 6px 8px; background: var(--panel);
+    border-top: 1px solid var(--border);
+    -webkit-overflow-scrolling: touch;
+  }
+  #qbar button {
+    flex: 0 0 auto;
+    background: var(--panel2); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 8px 12px; font-size: 13px; font-family: ui-monospace, monospace;
+  }
+  #inputbar {
+    display: flex; gap: 6px; padding: 8px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
+    background: var(--panel); border-top: 1px solid var(--border);
+  }
+  #inputbar input {
+    flex: 1; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; font-size: 15px;
+  }
+  #inputbar button {
+    background: var(--accent); color: #111; border: 0; border-radius: 10px;
+    padding: 10px 14px; font-weight: 600;
+  }
+  .empty { color: var(--muted); text-align: center; padding: 40px 20px; }
+</style>
+</head>
+<body>
+  <header>
+    <button id="openDrawer">Sessions</button>
+    <div class="title" id="activeName">No session</div>
+    <button id="reconnectBtn" title="Force reconnect" style="display:none">↻</button>
+    <span class="pill" id="connDot">•</span>
+    <button id="logToggle" class="pill" title="Toggle debug log" style="font-size:11px">log</button>
+    <span class="pill" id="verTag" style="font-size:10px; opacity:0.7">v12</span>
+  </header>
+  <div id="logpanel" style="display:none; max-height:30dvh; overflow:auto; background:#000; color:#8f8; font:11px ui-monospace,monospace; padding:6px 8px; border-bottom:1px solid var(--border)"></div>
+
+  <div id="term-wrap">
+    <div id="term"></div>
+    <button id="jumpBottom" type="button">↓ Latest</button>
+  </div>
+
+  <div id="qbar">
+    <button data-scroll="top">⤒</button>
+    <button data-scroll="pageup">⇞</button>
+    <button data-scroll="pagedown">⇟</button>
+    <button data-scroll="bottom">⤓</button>
+    <button data-send="\r">Enter</button>
+    <button data-send="\x1b">Esc</button>
+    <button data-send="y\r">y ↵</button>
+    <button data-send="n\r">n ↵</button>
+    <button data-send="\x03">Ctrl-C</button>
+    <button data-send="\x04">Ctrl-D</button>
+    <button data-send="\x1b[A">↑</button>
+    <button data-send="\x1b[B">↓</button>
+    <button data-send="/clear\r">/clear</button>
+    <button data-send="/compact\r">/compact</button>
+  </div>
+
+  <form id="inputbar" autocomplete="off">
+    <input id="msg" placeholder="Type and hit send…" autocapitalize="off" autocorrect="off" spellcheck="false" />
+    <button type="submit">Send</button>
+  </form>
+
+  <div id="drawer">
+    <div class="sheet">
+      <h2>New session</h2>
+      <div class="newbox">
+        <label>Name</label>
+        <input id="new-name" placeholder="my-project" />
+        <label>Working directory</label>
+        <input id="new-cwd" placeholder="/Users/you/code/my-project" />
+        <button id="new-go">Start Claude here</button>
+      </div>
+      <h2 style="margin-top:18px">Sessions</h2>
+      <div id="sess-list"></div>
+    </div>
+  </div>
+
+<script type="module">
+import { Terminal } from "https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm";
+import { FitAddon } from "https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm";
+
+const term = new Terminal({
+  cursorBlink: true,
+  fontSize: 13,
+  fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+  theme: { background: "#000000" },
+  scrollback: 5000,
+  convertEol: true,
+});
+const fit = new FitAddon();
+term.loadAddon(fit);
+term.open(document.getElementById("term"));
+requestAnimationFrame(() => fit.fit());
+
+let ws = null;
+let current = null;
+let currentRaw = false;
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+
+const $ = (id) => document.getElementById(id);
+const connDot = $("connDot");
+const setConn = (s) => {
+  connDot.textContent = s === "open" ? "● live" : s === "connecting" ? "… connecting" : "○ idle";
+  connDot.style.color = s === "open" ? "var(--good)" : s === "connecting" ? "var(--muted)" : "var(--danger)";
+};
+setConn("idle");
+
+// --- On-screen debug log so we can see what's actually happening on iOS
+// without needing Safari's remote inspector hooked up to a Mac.
+const logPanel = $("logpanel");
+const log = (msg) => {
+  const ts = new Date().toISOString().slice(11, 19);
+  const line = document.createElement("div");
+  line.textContent = `${ts} ${msg}`;
+  logPanel.appendChild(line);
+  // Cap log length.
+  while (logPanel.childElementCount > 200) logPanel.firstChild.remove();
+  logPanel.scrollTop = logPanel.scrollHeight;
+};
+$("logToggle").addEventListener("click", () => {
+  logPanel.style.display = logPanel.style.display === "none" ? "block" : "none";
+});
+log(`boot ${location.host} ua=${navigator.userAgent.slice(0,40)}`);
+
+function detach(sock) {
+  if (!sock) return;
+  sock.onopen = sock.onmessage = sock.onclose = sock.onerror = null;
+}
+
+function connect(name, { raw = false } = {}) {
+  log(`connect -> ${raw ? "raw " : ""}${name}`);
+  detach(ws);
+  if (ws) { try { ws.close(); } catch {} }
+  ws = null;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  current = name;
+  currentRaw = raw;
+  $("activeName").textContent = name;
+  $("reconnectBtn").style.display = "inline-block";
+  setConn("connecting");
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  // Make sure the fit addon has measured the actual on-screen terminal.
+  try { fit.fit(); } catch {}
+  const cols = term.cols || 80;
+  const rows = term.rows || 24;
+  const path = raw
+    ? `/ws-raw/${encodeURIComponent(name)}`
+    : `/ws/${encodeURIComponent(name)}`;
+  const sock = new WebSocket(`${proto}//${location.host}${path}?cols=${cols}&rows=${rows}`);
+  sock.binaryType = "arraybuffer";
+  ws = sock;
+  const stale = () => sock !== ws;
+
+  sock.onopen = () => {
+    if (stale()) { log("onopen stale, ignoring"); return; }
+    reconnectAttempt = 0;
+    log(`open cols=${cols} rows=${rows}`);
+    setConn("open");
+    term.focus();
+    sendResize();
+  };
+  sock.onmessage = (e) => {
+    if (stale()) return;
+    const data = typeof e.data === "string" ? e.data : new TextDecoder().decode(e.data);
+    term.write(data);
+  };
+  sock.onclose = (e) => {
+    if (stale()) { log(`stale close code=${e.code}`); return; }
+    log(`close code=${e.code} reason="${e.reason || ""}" wasClean=${e.wasClean}`);
+    setConn("idle");
+    if (e.code === 1008) {
+      term.write(`\r\n\x1b[31m[claude-remote] ${e.reason || "connection refused"}\x1b[0m\r\n`);
+      $("activeName").textContent = "No session";
+      current = null;
+      return;
+    }
+    scheduleReconnect();
+  };
+  sock.onerror = (e) => {
+    if (stale()) return;
+    log(`error (readyState=${sock.readyState})`);
+  };
+}
+
+function scheduleReconnect() {
+  if (!current) return;
+  if (reconnectTimer) return;
+  const delay = Math.min(8000, 500 * Math.pow(2, reconnectAttempt++));
+  log(`reconnect in ${delay}ms (attempt ${reconnectAttempt}, visible=${document.visibilityState})`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (!current) return;
+    connect(current, { raw: currentRaw });
+  }, delay);
+}
+
+// --- Wake-up: try to reconnect when the tab becomes visible again ---
+// Simple rule: page becomes visible AND we have a current session AND the
+// socket is not OPEN or CONNECTING -> reconnect. No watchdog, no heartbeat.
+// Those caused more false-positive disconnects than they solved.
+const wake = (why) => {
+  const state = ws ? ws.readyState : "no-ws";
+  log(`wake (${why}) visible=${document.visibilityState} current=${current} wsState=${state}`);
+  if (!current) return;
+  if (document.visibilityState !== "visible") return;
+  if (ws && (ws.readyState === 0 || ws.readyState === 1)) return; // already opening/open
+  reconnectAttempt = 0;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  connect(current, { raw: currentRaw });
+};
+document.addEventListener("visibilitychange", () => wake("visibilitychange"));
+window.addEventListener("pageshow", (e) => wake(`pageshow persisted=${e.persisted}`));
+window.addEventListener("focus", () => wake("focus"));
+window.addEventListener("online", () => wake("online"));
+
+// Manual reconnect button — always works, regardless of state.
+$("reconnectBtn").addEventListener("click", () => {
+  if (!current) return;
+  log("manual reconnect");
+  reconnectAttempt = 0;
+  connect(current, { raw: currentRaw });
+});
+
+// --- Keyboard-aware resize using visualViewport ---
+// The cleanest iOS pattern: drive the body's height directly from
+// visualViewport.height. 100dvh is close but inconsistent when xterm's
+// hidden textarea (tapped-to-type) gets focus vs a regular <input>.
+const applyViewport = () => {
+  if (window.visualViewport) {
+    document.body.style.height = `${window.visualViewport.height}px`;
+  }
+  try { fit.fit(); } catch {}
+  sendResize();
+  // Scroll terminal to bottom so the cursor stays visible when keyboard opens.
+  try { term.scrollToBottom(); } catch {}
+};
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", applyViewport);
+  window.visualViewport.addEventListener("scroll", applyViewport);
+}
+// Any focus/blur on ANY input or the terminal's hidden textarea triggers a
+// second async refit, because iOS animates the keyboard in over ~250ms.
+document.addEventListener("focusin", () => setTimeout(applyViewport, 300));
+document.addEventListener("focusout", () => setTimeout(applyViewport, 300));
+applyViewport();
+
+function sendRaw(s) {
+  if (ws && ws.readyState === 1) ws.send(s);
+}
+function sendResize() {
+  if (ws && ws.readyState === 1)
+    ws.send("\x01" + JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+}
+
+term.onData((d) => sendRaw(d));
+window.addEventListener("resize", () => { fit.fit(); sendResize(); });
+
+// Quick-action buttons (send keystrokes OR scroll)
+document.querySelectorAll("#qbar button").forEach((b) => {
+  b.addEventListener("click", (e) => {
+    e.preventDefault();
+    const scroll = b.getAttribute("data-scroll");
+    if (scroll) {
+      if (scroll === "top") term.scrollToTop();
+      else if (scroll === "bottom") term.scrollToBottom();
+      else if (scroll === "pageup") term.scrollLines(-Math.floor(term.rows * 0.8));
+      else if (scroll === "pagedown") term.scrollLines(Math.floor(term.rows * 0.8));
+      return;
+    }
+    const raw = b.getAttribute("data-send");
+    // decode basic escapes
+    const decoded = raw
+      .replace(/\\r/g, "\r").replace(/\\n/g, "\n")
+      .replace(/\\x1b/g, "\x1b").replace(/\\x03/g, "\x03").replace(/\\x04/g, "\x04");
+    sendRaw(decoded);
+    term.focus();
+  });
+});
+
+// --- Touch scroll: one-finger drag scrolls the terminal scrollback ---
+// xterm.js doesn't handle this natively on iOS; we translate touchmove
+// deltas into scrollLines() calls so the terminal feels like a normal
+// scrollable region.
+const termWrap = document.getElementById("term-wrap");
+const jumpBottom = document.getElementById("jumpBottom");
+let touchY = null;
+let touchAccum = 0;
+const lineHeightPx = () => {
+  // Best effort: xterm's row height isn't exposed directly; infer from element.
+  const rows = term.rows || 32;
+  return (termWrap.clientHeight - 12) / rows; // minus padding
+};
+termWrap.addEventListener("touchstart", (e) => {
+  if (e.touches.length !== 1) return;
+  touchY = e.touches[0].clientY;
+  touchAccum = 0;
+}, { passive: true });
+termWrap.addEventListener("touchmove", (e) => {
+  if (touchY == null || e.touches.length !== 1) return;
+  const y = e.touches[0].clientY;
+  const dy = touchY - y; // positive = swipe up = scroll down (toward latest)
+  touchY = y;
+  touchAccum += dy;
+  const lh = Math.max(8, lineHeightPx());
+  const lines = Math.trunc(touchAccum / lh);
+  if (lines !== 0) {
+    term.scrollLines(lines);
+    touchAccum -= lines * lh;
+  }
+}, { passive: true });
+termWrap.addEventListener("touchend", () => { touchY = null; }, { passive: true });
+
+// Show "jump to bottom" pill when user has scrolled up
+const updateJumpPill = () => {
+  const atBottom = term.buffer.active.viewportY + term.rows >= term.buffer.active.length;
+  jumpBottom.classList.toggle("show", !atBottom);
+};
+term.onScroll(updateJumpPill);
+term.onLineFeed(updateJumpPill);
+jumpBottom.addEventListener("click", () => { term.scrollToBottom(); updateJumpPill(); });
+
+// Text input: send the typed text, then send the Enter byte slightly later
+// so Claude's ink-based input UI has a frame to ingest the text before it
+// sees the submit keystroke. A combined "text\r" burst can race inside ink.
+$("inputbar").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const v = $("msg").value;
+  log(`send len=${v.length} wsState=${ws ? ws.readyState : "none"}`);
+  if (!v) {
+    sendRaw("\r"); // empty send acts as plain Enter
+    return;
+  }
+  if (!ws || ws.readyState !== 1) {
+    log("send ignored: socket not open");
+    return;
+  }
+  sendRaw(v);
+  setTimeout(() => sendRaw("\r"), 30);
+  $("msg").value = "";
+});
+
+// Drawer
+const drawer = $("drawer");
+$("openDrawer").addEventListener("click", () => { drawer.classList.add("open"); refresh(); });
+drawer.addEventListener("click", (e) => { if (e.target === drawer) drawer.classList.remove("open"); });
+
+const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+);
+
+function renderRow(s) {
+  const row = document.createElement("div");
+  row.className = "session-row";
+  const subtitle = s.hasClaude
+    ? `claude • ${s.cwd || ""}`
+    : `${s.currentCommand || "shell"} • ${s.cwd || ""}`;
+  row.innerHTML = `
+    <span class="dot ${s.attached ? "live" : ""}"></span>
+    <div style="flex:1; min-width:0">
+      <div class="name">${escapeHtml(s.name)}</div>
+      <div class="cwd">${escapeHtml(subtitle)}</div>
+    </div>
+    ${s.managed ? `<button class="kill" data-kill="1">Kill</button>` : ""}
+  `;
+  row.addEventListener("click", (ev) => {
+    if (ev.target.matches("[data-kill]")) return;
+    drawer.classList.remove("open");
+    connect(s.managed ? s.name : s.rawName, { raw: !s.managed });
+  });
+  const killBtn = row.querySelector("[data-kill]");
+  if (killBtn) {
+    killBtn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      if (!confirm(`Kill session "${s.name}"?`)) return;
+      await fetch(`/api/sessions/${encodeURIComponent(s.name)}`, { method: "DELETE" });
+      refresh();
+    });
+  }
+  return row;
+}
+
+async function refresh() {
+  const r = await fetch("/api/sessions");
+  const list = await r.json();
+  const wrap = $("sess-list");
+  // Group by what's actually running, not by name prefix.
+  const claudeSessions = list.filter((s) => s.hasClaude);
+  const other = list.filter((s) => !s.hasClaude);
+  if (!list.length) {
+    wrap.innerHTML = '<div class="empty">No sessions yet. Start one above.</div>';
+    return;
+  }
+  wrap.innerHTML = "";
+  if (!claudeSessions.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.style.padding = "20px 10px";
+    empty.textContent = "No Claude sessions running. Start one above, or open a shell below.";
+    wrap.appendChild(empty);
+  }
+  for (const s of claudeSessions) wrap.appendChild(renderRow(s));
+  if (other.length) {
+    const hdr = document.createElement("h2");
+    hdr.style.marginTop = "18px";
+    hdr.textContent = "Other tmux sessions";
+    wrap.appendChild(hdr);
+    for (const s of other) wrap.appendChild(renderRow(s));
+  }
+}
+
+$("new-go").addEventListener("click", async () => {
+  const name = $("new-name").value.trim();
+  const cwd = $("new-cwd").value.trim();
+  if (!name) return alert("Name required");
+  const r = await fetch("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, cwd }),
+  });
+  const body = await r.json();
+  if (!r.ok) return alert(body.error || "failed");
+  $("new-name").value = "";
+  await refresh();
+  drawer.classList.remove("open");
+  connect(name);
+});
+
+// Initial load
+refresh().then(() => {
+  // Auto-open drawer on first load so user can pick
+  drawer.classList.add("open");
+});
+</script>
+</body>
+</html>
