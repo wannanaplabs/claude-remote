@@ -38,6 +38,24 @@ npm install
 `node-pty` builds a native module; if it complains, `xcode-select --install`
 once and retry.
 
+### macOS gotcha: `spawn-helper` executable bit
+
+On Apple Silicon + Node 22, `npm install` may extract
+`node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper` without the
+execute bit. The symptom is every WebSocket attach crashing the Node process
+with `posix_spawnp failed.` One-liner fix (re-run after any `npm install`):
+
+```bash
+chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper
+```
+
+If `tmux` isn't on node-pty's `posix_spawnp` PATH (Homebrew on
+`/opt/homebrew/bin` is the usual culprit), pass the absolute path:
+
+```bash
+TMUX_BIN=/opt/homebrew/bin/tmux npm start
+```
+
 ## Run
 
 Easiest: bind to all interfaces on your tailnet (still private because only
@@ -76,10 +94,64 @@ since the whole thing is tmux anyway.
 | `DEFAULT_CWD`    | `$HOME`           | Used when "New session" leaves cwd blank            |
 | `NTFY_TOPIC`     | *(empty)*         | Your private ntfy.sh topic, e.g. `claude-frank-9x7q`. If empty, push is off. |
 | `IDLE_PING_MS`   | `30000`           | How long of "no output" before a push fires        |
+| `TMUX_BIN`       | `tmux`            | Absolute path to tmux if node-pty can't find it (e.g. `/opt/homebrew/bin/tmux`) |
 
 For ntfy: install the ntfy app on your phone, subscribe to whatever topic
 name you pick (make it random, it's unauthenticated), then set
 `NTFY_TOPIC=that-same-name` when starting the server.
+
+## Recommended host setup
+
+Two small bits of config on the Mac that make this a lot nicer to live with.
+
+### `~/.tmux.conf` — mouse scroll + more history
+
+Without this, scroll wheel does nothing inside tmux (tmux captures all output
+into its own scrollback, but doesn't forward mouse events by default).
+
+```tmux
+set -g mouse on
+set -g history-limit 50000
+set -g default-terminal "screen-256color"
+set -ga terminal-overrides ",xterm-256color:Tc"
+```
+
+Apply without restart: `tmux source-file ~/.tmux.conf`.
+
+### VS Code: auto-wrap every integrated terminal in tmux
+
+Add to `~/Library/Application Support/Code/User/settings.json`:
+
+```json
+{
+  "terminal.integrated.profiles.osx": {
+    "claude-tmux": {
+      "path": "/opt/homebrew/bin/tmux",
+      "args": [
+        "new-session",
+        "-A",
+        "-s", "cc-${workspaceFolderBasename}"
+      ],
+      "icon": "terminal-tmux"
+    }
+  },
+  "terminal.integrated.defaultProfile.osx": "claude-tmux"
+}
+```
+
+What this does:
+
+- Every new integrated terminal auto-attaches to `cc-<workspace>` (the `-A`
+  flag = attach-if-exists, create-if-not — idempotent). Re-opening VS Code
+  reattaches to the same tmux session, scrollback intact.
+- Because the name starts with `cc-`, `claude-remote` lists it as a
+  "managed" session on your phone, and the Kill button works.
+- Multiple terminals in the same workspace share one tmux session; use
+  tmux's own windows/panes (`Ctrl-b c`, `Ctrl-b "`) for splits — those show
+  up on the phone too.
+
+Use the absolute tmux path (`/opt/homebrew/bin/tmux`) since VS Code's GUI
+launch doesn't always pick up Homebrew's `PATH`.
 
 ## How it works
 
