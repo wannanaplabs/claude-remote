@@ -20,8 +20,10 @@ On the Mac:
 
 ```bash
 brew install tmux node            # node 20+
-npm install -g @anthropic-ai/claude-code
 ```
+
+Plus [Claude Code](https://docs.claude.com/claude-code) installed and
+runnable as `claude`.
 
 Tailscale on the Mac and on your phone (same tailnet). You already planned
 to use this.
