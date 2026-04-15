@@ -24,17 +24,13 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
     overscroll-behavior: none;
   }
-  /* Anchor the body to the top of the initial viewport so iOS can't auto-
-     scroll the page when an input is focused — otherwise the page shifts
-     up and leaves a gap beneath the keyboard.  The height is driven by JS
-     from visualViewport.height, which is the true ex-keyboard height. */
+  /* position:fixed stops iOS auto-scrolling on focus; height is set in JS
+     from visualViewport.height (the true ex-keyboard height). */
   body {
     display: flex; flex-direction: column;
     position: fixed; top: 0; left: 0; right: 0;
     height: 100dvh; min-height: 0;
   }
-  /* When the soft keyboard is visible we add a .kbd class on body; zero the
-     safe-area bottom inset because the home indicator is hidden anyway. */
   body.kbd #inputbar { padding-bottom: 4px; }
 
   header {
@@ -93,14 +89,12 @@
     font-weight: 600; font-size: 14px;
   }
 
-  /* Terminal */
   #term-wrap {
     flex: 1; min-height: 0; background: #000;
     padding: 6px; overflow: hidden; position: relative;
     touch-action: none; /* we handle touch scroll manually */
   }
   #term { width: 100%; height: 100%; }
-  /* Floating jump-to-bottom pill, shows when user has scrolled up */
   #jumpBottom {
     position: absolute; right: 10px; bottom: 10px;
     background: var(--accent); color: #111; border: 0;
@@ -147,7 +141,6 @@
     <button id="reconnectBtn" title="Force reconnect" style="display:none">↻</button>
     <span class="pill" id="connDot">•</span>
     <button id="logToggle" class="pill" title="Toggle debug log" style="font-size:11px">log</button>
-    <span class="pill" id="verTag" style="font-size:10px; opacity:0.7">v17</span>
   </header>
   <div id="logpanel" style="display:none; max-height:30dvh; overflow:auto; background:#000; color:#8f8; font:11px ui-monospace,monospace; padding:6px 8px; border-bottom:1px solid var(--border)"></div>
 
@@ -221,15 +214,13 @@ const setConn = (s) => {
 };
 setConn("idle");
 
-// --- On-screen debug log so we can see what's actually happening on iOS
-// without needing Safari's remote inspector hooked up to a Mac.
+// iOS-friendly on-screen log, toggled by the `log` pill.
 const logPanel = $("logpanel");
 const log = (msg) => {
   const ts = new Date().toISOString().slice(11, 19);
   const line = document.createElement("div");
   line.textContent = `${ts} ${msg}`;
   logPanel.appendChild(line);
-  // Cap log length.
   while (logPanel.childElementCount > 200) logPanel.firstChild.remove();
   logPanel.scrollTop = logPanel.scrollHeight;
 };
@@ -255,7 +246,6 @@ function connect(name, { raw = false } = {}) {
   $("reconnectBtn").style.display = "inline-block";
   setConn("connecting");
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  // Make sure the fit addon has measured the actual on-screen terminal.
   try { fit.fit(); } catch {}
   const cols = term.cols || 80;
   const rows = term.rows || 24;
@@ -310,10 +300,8 @@ function scheduleReconnect() {
   }, delay);
 }
 
-// --- Wake-up: try to reconnect when the tab becomes visible again ---
-// Simple rule: page becomes visible AND we have a current session AND the
-// socket is not OPEN or CONNECTING -> reconnect. No watchdog, no heartbeat.
-// Those caused more false-positive disconnects than they solved.
+// Reconnect when the tab becomes visible again (iOS closes WS on lock).
+// Rule: visible + have a session + socket not open/connecting -> reconnect.
 const wake = (why) => {
   const state = ws ? ws.readyState : "no-ws";
   log(`wake (${why}) visible=${document.visibilityState} current=${current} wsState=${state}`);
@@ -329,7 +317,6 @@ window.addEventListener("pageshow", (e) => wake(`pageshow persisted=${e.persiste
 window.addEventListener("focus", () => wake("focus"));
 window.addEventListener("online", () => wake("online"));
 
-// Manual reconnect button — always works, regardless of state.
 $("reconnectBtn").addEventListener("click", () => {
   if (!current) return;
   log("manual reconnect");
@@ -337,20 +324,15 @@ $("reconnectBtn").addEventListener("click", () => {
   connect(current, { raw: currentRaw });
 });
 
-// --- Keyboard-aware resize using visualViewport ---
-// Drive the body's height directly from visualViewport.height — that's the
-// true ex-keyboard height on iOS. Toggle a body.kbd class so CSS can tighten
-// padding while the keyboard is up, and force window.scrollTo(0,0) so any
-// iOS auto-scroll doesn't leave a gap.
+// Size the body from visualViewport.height — the true ex-keyboard height
+// on iOS. 100dvh is close but misbehaves when xterm's hidden textarea is
+// focused rather than a regular input.
 const applyViewport = () => {
   const vv = window.visualViewport;
   if (vv) {
     document.body.style.height = `${vv.height}px`;
-    // Keyboard is open if the visual viewport is meaningfully shorter than
-    // the layout viewport. Threshold of 80px avoids false positives from
-    // Safari's shrinking URL bar.
-    const kbdOpen = (window.innerHeight - vv.height) > 80;
-    document.body.classList.toggle("kbd", kbdOpen);
+    // 80px threshold avoids false positives from Safari's shrinking URL bar.
+    document.body.classList.toggle("kbd", (window.innerHeight - vv.height) > 80);
   }
   // Cancel any auto-scroll iOS applied to reveal a focused input.
   window.scrollTo(0, 0);
@@ -377,41 +359,30 @@ function sendResize() {
 term.onData((d) => sendRaw(d));
 window.addEventListener("resize", () => { fit.fit(); sendResize(); });
 
-// Quick-action buttons (send keystrokes OR scroll)
 document.querySelectorAll("#qbar button").forEach((b) => {
   b.addEventListener("click", (e) => {
     e.preventDefault();
     const scroll = b.getAttribute("data-scroll");
-    if (scroll) {
-      if (scroll === "top") term.scrollToTop();
-      else if (scroll === "bottom") term.scrollToBottom();
-      else if (scroll === "pageup") {
-        term.scrollLines(-Math.floor(term.rows * 0.8));
-        // Forward a batch of wheel-up events for apps that use alt-screen.
-        for (let i = 0; i < 5; i++) sendWheel(-1);
-      } else if (scroll === "pagedown") {
-        term.scrollLines(Math.floor(term.rows * 0.8));
-        for (let i = 0; i < 5; i++) sendWheel(1);
-      }
+    if (scroll === "pageup" || scroll === "pagedown") {
+      const n = Math.floor(term.rows * 0.8);
+      const dir = scroll === "pageup" ? -1 : 1;
+      term.scrollLines(dir * n);
+      for (let i = 0; i < n; i++) sendWheel(dir);
       return;
     }
     const raw = b.getAttribute("data-send");
-    // decode basic escapes
     const decoded = raw
-      .replace(/\\r/g, "\r").replace(/\\n/g, "\n")
-      .replace(/\\x1b/g, "\x1b").replace(/\\x03/g, "\x03").replace(/\\x04/g, "\x04");
+      .replace(/\\r/g, "\r")
+      .replace(/\\x1b/g, "\x1b").replace(/\\x03/g, "\x03");
     sendRaw(decoded);
     term.focus();
   });
 });
 
-// --- Touch scroll: one-finger drag scrolls the terminal ---
-// Two parallel tracks:
-//  1. Scroll xterm's own scrollback (for plain shell output).
-//  2. Send SGR mouse wheel escape sequences to the pty. With tmux's
-//     `mouse on`, this makes tmux enter copy mode and scroll its buffer.
-//     Inside Claude's alt-screen UI, the wheel events reach Claude directly.
-// Both are cheap; whichever path the remote app understands wins.
+// Touch drag scrolls two ways so something works regardless of who owns the
+// screen: term.scrollLines moves xterm's own buffer (plain shell), and an
+// SGR mouse wheel sequence goes to the pty so tmux (with `mouse on`) enters
+// copy mode and Claude's alt-screen UI can scroll.
 const termWrap = document.getElementById("term-wrap");
 const jumpBottom = document.getElementById("jumpBottom");
 let touchY = null;
@@ -420,9 +391,7 @@ const lineHeightPx = () => {
   const rows = term.rows || 32;
   return (termWrap.clientHeight - 12) / rows;
 };
-// SGR mouse wheel encoding: \x1b[<Cb;Col;Row M where
-//   Cb = 64 (wheel up, older content), 65 (wheel down, newer content).
-// Col/Row are 1-based; the remote side doesn't really care about position.
+// SGR wheel: Cb=64 up, Cb=65 down. Col/Row are placeholders.
 const sendWheel = (direction) => {
   if (!ws || ws.readyState !== 1) return;
   const code = direction < 0 ? 64 : 65;
@@ -443,7 +412,6 @@ termWrap.addEventListener("touchmove", (e) => {
   const lines = Math.trunc(touchAccum / lh);
   if (lines !== 0) {
     term.scrollLines(lines);
-    // Forward as wheel events to the pty (tmux / Claude) too.
     const step = lines > 0 ? 1 : -1;
     for (let i = 0; i < Math.abs(lines); i++) sendWheel(step);
     touchAccum -= lines * lh;
@@ -451,7 +419,6 @@ termWrap.addEventListener("touchmove", (e) => {
 }, { passive: true });
 termWrap.addEventListener("touchend", () => { touchY = null; }, { passive: true });
 
-// Show "jump to bottom" pill when user has scrolled up
 const updateJumpPill = () => {
   const atBottom = term.buffer.active.viewportY + term.rows >= term.buffer.active.length;
   jumpBottom.classList.toggle("show", !atBottom);
@@ -460,9 +427,8 @@ term.onScroll(updateJumpPill);
 term.onLineFeed(updateJumpPill);
 jumpBottom.addEventListener("click", () => { term.scrollToBottom(); updateJumpPill(); });
 
-// Text input: send the typed text, then send the Enter byte slightly later
-// so Claude's ink-based input UI has a frame to ingest the text before it
-// sees the submit keystroke. A combined "text\r" burst can race inside ink.
+// Split the submit into text + Enter with a small delay so Claude's ink UI
+// has a frame to ingest the text before it sees the submit keystroke.
 $("inputbar").addEventListener("submit", (e) => {
   e.preventDefault();
   const v = $("msg").value;
@@ -480,7 +446,6 @@ $("inputbar").addEventListener("submit", (e) => {
   $("msg").value = "";
 });
 
-// Drawer
 const drawer = $("drawer");
 $("openDrawer").addEventListener("click", () => { drawer.classList.add("open"); refresh(); });
 drawer.addEventListener("click", (e) => { if (e.target === drawer) drawer.classList.remove("open"); });
@@ -525,7 +490,6 @@ async function refresh() {
   if (r.status === 401) { location.href = "/login"; return; }
   const list = await r.json();
   const wrap = $("sess-list");
-  // Group by what's actually running, not by name prefix.
   const claudeSessions = list.filter((s) => s.hasClaude);
   const other = list.filter((s) => !s.hasClaude);
   if (!list.length) {
@@ -554,6 +518,7 @@ $("new-go").addEventListener("click", async () => {
   const name = $("new-name").value.trim();
   const cwd = $("new-cwd").value.trim();
   if (!name) return alert("Name required");
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return alert("Name: letters, digits, _ or - only");
   const r = await fetch("/api/sessions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -567,11 +532,7 @@ $("new-go").addEventListener("click", async () => {
   connect(name);
 });
 
-// Initial load
-refresh().then(() => {
-  // Auto-open drawer on first load so user can pick
-  drawer.classList.add("open");
-});
+refresh().then(() => { drawer.classList.add("open"); });
 </script>
 </body>
 </html>

@@ -10,8 +10,8 @@ from your phone over Tailscale. Each "chat" is a `tmux` session running
 - A phone-first web UI at `http://<mac-tailscale-name>:8765`
 - A session picker (tap to open, swipe-close to go back)
 - "New session" launcher with a working-directory field
-- Quick-action buttons for things that are a pain to type on a phone:
-  `Enter`, `Esc`, `y↵`, `n↵`, `Ctrl-C`, `Ctrl-D`, arrows, `/clear`, `/compact`
+- Quick-action buttons for the keys that are painful on iOS:
+  page-up/down, `Enter`, `Esc`, `y↵`, `n↵`, `Ctrl-C`, and arrow keys
 - A plain text box that sends the message + Enter (chat-app feel)
 
 ## Prereqs
@@ -202,9 +202,10 @@ your macOS username.
 
 - Layer 1 — network: `BIND` to the Tailscale IP keeps the listener inside
   your tailnet. Don't expose port 8765 to the public internet.
-- Layer 2 — password: set `AUTH_PASSWORD` for HTTP Basic Auth on every
-  request and WS upgrade (constant-time compare, no timing leak). Prevents
-  a compromised tailnet member from silently driving a Claude session.
+- Layer 2 — password: set `AUTH_PASSWORD` for cookie-based login on every
+  HTTP request and WS upgrade (constant-time compare, no timing leak).
+  Prevents a compromised tailnet member from silently driving a Claude
+  session. Cross-origin POST/DELETE and WS upgrades are rejected too.
 - Layer 3 — per-user identity: front it with
   [`tailscale serve`](https://tailscale.com/kb/1242/tailscale-serve) and
   read the `Tailscale-User-Login` header if you want actual identity.

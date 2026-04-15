@@ -1,18 +1,6 @@
-// claude-remote: a tiny web bridge so you can drive Claude Code CLI sessions
-// from your phone over Tailscale. Each "chat" is a tmux session running
-// `claude`, so sessions survive disconnects and you can still `tmux attach`
-// from a terminal.
-//
-// Endpoints:
-//   GET  /api/sessions                  -> list tmux sessions (name, cwd, busy)
-//   POST /api/sessions                  -> { name, cwd } create a new session
-//   DELETE /api/sessions/:name          -> kill a session
-//   WS   /ws/:name                      -> bidirectional pty stream (xterm.js)
-//
-// Auth: none by default; set AUTH_PASSWORD for cookie-based login.
-// Network: bind to the Tailscale IP so only your tailnet can reach it.
+// See CLAUDE.md for architecture. tl;dr: HTTP + WS bridge that pipes a
+// `tmux attach` pty through xterm.js on the phone over Tailscale.
 
-// Load .env first so any config below sees the values.
 require("dotenv").config();
 
 const express = require("express");
@@ -25,11 +13,8 @@ const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
 
-// --- macOS boot-time fixups, so `npm start` just works ---
-
-// 1. node-pty's `prebuilds/*/spawn-helper` sometimes extracts without the
-//    execute bit, which causes every pty.spawn to throw "posix_spawnp
-//    failed." Fix it once, idempotently.
+// npm sometimes strips the exec bit from node-pty's spawn-helper, which
+// makes every pty.spawn throw "posix_spawnp failed." Fix idempotently.
 for (const arch of ["darwin-arm64", "darwin-x64"]) {
   const helper = path.join(__dirname, "node_modules", "node-pty", "prebuilds", arch, "spawn-helper");
   try {
@@ -38,8 +23,8 @@ for (const arch of ["darwin-arm64", "darwin-x64"]) {
   } catch {} // file not present for this arch — fine
 }
 
-// 2. node-pty's posix_spawnp is pickier about PATH than Node's own spawn,
-//    so look up the absolute path to tmux if TMUX_BIN wasn't already set.
+// node-pty's posix_spawnp ignores Node's PATH tweaks, so we hand it an
+// absolute tmux path. Falls back to PATH lookup + Homebrew/system defaults.
 function resolveTmuxBin() {
   if (process.env.TMUX_BIN) return process.env.TMUX_BIN;
   try {
@@ -49,11 +34,10 @@ function resolveTmuxBin() {
   for (const p of ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]) {
     if (fs.existsSync(p)) return p;
   }
-  return "tmux"; // let it fail loudly later
+  return "tmux";
 }
 
-// 3. Default BIND to the Tailscale IP so the listener is only reachable
-//    over the tailnet, not whatever LAN the Mac is on.
+// Default BIND to the Tailscale IP so we're only reachable over the tailnet.
 function resolveBind() {
   if (process.env.BIND) return process.env.BIND;
   try {
@@ -69,16 +53,11 @@ const SESSION_PREFIX = process.env.SESSION_PREFIX || "cc-"; // tmux session pref
 const CLAUDE_CMD = process.env.CLAUDE_CMD || "claude";
 const DEFAULT_CWD = process.env.DEFAULT_CWD || os.homedir();
 const TMUX_BIN = resolveTmuxBin();
-// Optional password. If set, HTTP and WS both require HTTP Basic Auth with
-// any username and this exact password. iOS Safari caches credentials in
-// Keychain after the first prompt, so the friction is one-time.
+// Optional password. If set, HTTP and WS both require the login cookie.
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "";
 
-// Cookie-based auth: one password field on a login page, server sets a
-// signed cookie valid for a year. HMAC-SHA256 over a fixed string keyed by
-// the password means (a) cookies are stable for a given password so you
-// don't need to re-login on server restart, and (b) rotating AUTH_PASSWORD
-// invalidates every outstanding cookie.
+// HMAC keyed by the password: cookies survive server restarts but rotating
+// AUTH_PASSWORD invalidates every outstanding cookie.
 const AUTH_COOKIE_NAME = "cr_auth";
 const authToken = AUTH_PASSWORD
   ? crypto.createHmac("sha256", AUTH_PASSWORD).update("claude-remote").digest("hex")
@@ -111,6 +90,35 @@ function checkPassword(password) {
   const b = Buffer.from(AUTH_PASSWORD, "utf8");
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+// CSRF defence: reject cross-origin POST/DELETE and cross-origin WS upgrades.
+// Non-browser clients (curl, the WS test suite) don't send Origin and pass.
+function sameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch { return false; }
+}
+
+// Keep control characters out of log lines so a crafted URL/UA can't forge
+// log entries or break log-parsing downstream.
+const stripCtl = (s) => String(s || "").replace(/[\r\n\x00-\x1f]/g, "?").slice(0, 200);
+
+// Per-IP brute force limiter on /login. 5 failures -> 1 minute lockout.
+const loginFailures = new Map();
+function loginLockedOut(ip) {
+  const rec = loginFailures.get(ip);
+  if (!rec) return false;
+  if (Date.now() > rec.until) { loginFailures.delete(ip); return false; }
+  return rec.count >= 5;
+}
+function noteLoginFailure(ip) {
+  const rec = loginFailures.get(ip) || { count: 0, until: 0 };
+  rec.count++;
+  rec.until = Date.now() + 60_000;
+  loginFailures.set(ip, rec);
 }
 
 const LOGIN_PAGE = `<!doctype html>
@@ -150,56 +158,48 @@ function tmux(args, opts = {}) {
 const isClaudePane = (cmd) => cmd === "claude" || /^\d+\.\d+(\.\d+)?$/.test(cmd);
 
 function listPaneCommands() {
-  try {
-    const out = tmux(
-      ["list-panes", "-a", "-F", "#{session_name}\t#{pane_current_command}"],
-      { allowFail: true }
-    );
-    const map = new Map();
-    for (const line of (out || "").trim().split("\n").filter(Boolean)) {
-      const [sess, cmd] = line.split("\t");
-      if (!map.has(sess)) map.set(sess, []);
-      map.get(sess).push(cmd);
-    }
-    return map;
-  } catch {
-    return new Map();
+  const out = tmux(
+    ["list-panes", "-a", "-F", "#{session_name}\t#{pane_current_command}"],
+    { allowFail: true }
+  );
+  const map = new Map();
+  for (const line of (out || "").trim().split("\n").filter(Boolean)) {
+    const [sess, cmd] = line.split("\t");
+    if (!map.has(sess)) map.set(sess, []);
+    map.get(sess).push(cmd);
   }
+  return map;
 }
 
 function listSessions() {
-  try {
-    const out = tmux(
-      [
-        "list-sessions",
-        "-F",
-        "#{session_name}\t#{session_path}\t#{session_attached}\t#{session_activity}",
-      ],
-      { allowFail: true }
-    );
-    if (!out) return [];
-    const paneMap = listPaneCommands();
-    return out
-      .trim()
-      .split("\n")
-      .map((l) => {
-        const [rawName, cwd, attached, activity] = l.split("\t");
-        const managed = rawName.startsWith(SESSION_PREFIX);
-        const cmds = paneMap.get(rawName) || [];
-        return {
-          name: managed ? rawName.slice(SESSION_PREFIX.length) : rawName,
-          rawName,
-          managed,
-          hasClaude: cmds.some(isClaudePane),
-          currentCommand: cmds[0] || "",
-          cwd,
-          attached: attached !== "0",
-          lastActivity: Number(activity) * 1000,
-        };
-      });
-  } catch {
-    return [];
-  }
+  const out = tmux(
+    [
+      "list-sessions",
+      "-F",
+      "#{session_name}\t#{session_path}\t#{session_attached}\t#{session_activity}",
+    ],
+    { allowFail: true }
+  );
+  if (!out) return [];
+  const paneMap = listPaneCommands();
+  return out
+    .trim()
+    .split("\n")
+    .map((l) => {
+      const [rawName, cwd, attached, activity] = l.split("\t");
+      const managed = rawName.startsWith(SESSION_PREFIX);
+      const cmds = paneMap.get(rawName) || [];
+      return {
+        name: managed ? rawName.slice(SESSION_PREFIX.length) : rawName,
+        rawName,
+        managed,
+        hasClaude: cmds.some(isClaudePane),
+        currentCommand: cmds[0] || "",
+        cwd,
+        attached: attached !== "0",
+        lastActivity: Number(activity) * 1000,
+      };
+    });
 }
 
 function sessionExists(rawName) {
@@ -236,25 +236,29 @@ function killSession(name) {
 
 const app = express();
 app.use(express.json());
-// Log every request so we can see what the phone actually sends.
-app.use((req, _res, next) => {
-  console.log(`[http] ${req.method} ${req.url} ua="${(req.headers["user-agent"]||"").slice(0,60)}"`);
-  next();
-});
-// Form-urlencoded for the login POST.
 app.use(express.urlencoded({ extended: false }));
 
-// Public login routes — no auth required for these.
+app.use((req, _res, next) => {
+  console.log(`[http] ${req.method} ${stripCtl(req.url)} ua="${stripCtl(req.headers["user-agent"]).slice(0,60)}"`);
+  next();
+});
+
 app.get("/login", (_req, res) => {
   res.set("Cache-Control", "no-store");
   res.status(200).send(LOGIN_PAGE.replace("__ERR__", ""));
 });
 app.post("/login", (req, res) => {
+  const ip = req.socket.remoteAddress || "?";
+  res.set("Cache-Control", "no-store");
+  if (loginLockedOut(ip)) {
+    return res.status(429).send(LOGIN_PAGE.replace("__ERR__", "Too many attempts — try again in a minute"));
+  }
   const pw = (req.body && req.body.password) || "";
   if (!checkPassword(pw)) {
-    res.set("Cache-Control", "no-store");
+    noteLoginFailure(ip);
     return res.status(401).send(LOGIN_PAGE.replace("__ERR__", "Wrong password"));
   }
+  loginFailures.delete(ip);
   res.set(
     "Set-Cookie",
     `${AUTH_COOKIE_NAME}=${authToken}; HttpOnly; Path=/; Max-Age=31536000; SameSite=Strict`
@@ -262,16 +266,15 @@ app.post("/login", (req, res) => {
   res.redirect(302, "/");
 });
 
-// HTTP auth gate for everything else. No-op if AUTH_PASSWORD is unset.
+// Auth gate. Browsers on HTML paths get redirected to /login; API/WS clients get JSON 401.
 app.use((req, res, next) => {
   if (checkAuth(req)) return next();
-  // Browsers hitting HTML paths get redirected to /login.
-  // API/WS clients get 401 JSON.
   if (req.method === "GET" && (req.path === "/" || req.path.endsWith(".html"))) {
     return res.redirect(302, "/login");
   }
   res.status(401).json({ error: "auth required" });
 });
+
 // Force-fresh HTML/JS so iOS Safari doesn't serve stale code after edits.
 app.use((req, res, next) => {
   if (req.path === "/" || req.path.endsWith(".html") || req.path.endsWith(".js")) {
@@ -286,6 +289,7 @@ app.get("/api/sessions", (_req, res) => {
 });
 
 app.post("/api/sessions", (req, res) => {
+  if (!sameOrigin(req)) return res.status(403).json({ error: "bad origin" });
   const { name, cwd } = req.body || {};
   if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
     return res.status(400).json({ error: "invalid name" });
@@ -299,67 +303,55 @@ app.post("/api/sessions", (req, res) => {
 });
 
 app.delete("/api/sessions/:name", (req, res) => {
-  // Managed-only: we refuse to kill sessions outside our prefix so the
-  // phone UI can never accidentally take down unrelated tmux sessions.
+  if (!sameOrigin(req)) return res.status(403).json({ error: "bad origin" });
+  // killSession prepends SESSION_PREFIX, so only managed sessions can ever
+  // be killed from this endpoint — arbitrary tmux sessions are safe.
   killSession(req.params.name);
   res.json({ ok: true });
 });
 
-// ---------- WebSocket: pipe tmux attach <-> client ----------
+// ---------- WebSocket ----------
 
 const server = http.createServer(app);
-// Use noServer mode so we fully control when the ws library sees an upgrade.
-// Otherwise the ws library's upgrade listener runs first and writes the 101
-// response before our auth check gets a chance to reject.
+// noServer mode so our auth check runs before ws writes the 101 response.
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  console.log(`[ws] upgrade ${req.url} from ${req.socket.remoteAddress}`);
-  if (!checkAuth(req)) {
-    console.log(`[ws] upgrade denied: auth failed`);
-    socket.write(
-      "HTTP/1.1 401 Unauthorized\r\n" +
-      "Connection: close\r\n\r\n"
-    );
+  console.log(`[ws] upgrade ${stripCtl(req.url)} from ${req.socket.remoteAddress}`);
+  if (!sameOrigin(req) || !checkAuth(req)) {
+    console.log(`[ws] upgrade denied`);
+    socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
 wss.on("connection", (ws, req) => {
-  console.log(`[ws] connection accepted ${req.url}`);
   const url = new URL(req.url, "http://x");
-  // Two shapes:
-  //   /ws/<short>        — managed session (we prepend SESSION_PREFIX)
-  //   /ws-raw/<rawname>  — any tmux session, already-prefixed name passed verbatim
+  // /ws/<short> = managed session (we prepend SESSION_PREFIX).
+  // /ws-raw/<rawname> = any tmux session by exact name, for viewing
+  //   unmanaged sessions from the phone. Killable only via /ws (managed).
   const managedMatch = url.pathname.match(/^\/ws\/([a-zA-Z0-9_-]+)$/);
   const rawMatch = url.pathname.match(/^\/ws-raw\/([a-zA-Z0-9_.\-]+)$/);
   let rawName;
-  if (managedMatch) {
-    rawName = SESSION_PREFIX + managedMatch[1];
-  } else if (rawMatch) {
-    rawName = decodeURIComponent(rawMatch[1]);
-  } else {
-    return ws.close(1008, "bad path");
-  }
+  if (managedMatch) rawName = SESSION_PREFIX + managedMatch[1];
+  else if (rawMatch) rawName = decodeURIComponent(rawMatch[1]);
+  else return ws.close(1008, "bad path");
   if (!sessionExists(rawName)) return ws.close(1008, "no such session");
-  const name = rawName.startsWith(SESSION_PREFIX)
-    ? rawName.slice(SESSION_PREFIX.length)
-    : rawName;
 
-  const cols = Number(url.searchParams.get("cols") || 100);
-  const rows = Number(url.searchParams.get("rows") || 32);
+  // Clamp client-reported terminal size so a malformed or huge resize can't
+  // stress the pty. 500 is arbitrary but comfortably above any real screen.
+  const clampSize = (n, dflt) => {
+    const v = Number(n);
+    if (!Number.isFinite(v) || v < 1) return dflt;
+    return Math.min(v, 500);
+  };
+  const cols = clampSize(url.searchParams.get("cols"), 100);
+  const rows = clampSize(url.searchParams.get("rows"), 32);
 
-  // Attach a fresh pty to the tmux session. Using `-r` would be read-only;
-  // we want interactive. `-d` detaches other clients to keep things tidy,
-  // but we skip it so multiple phones/desktops can co-watch.
-  // node-pty's posix_spawnp is stricter about PATH than Node's own spawn,
-  // so we use the absolute TMUX_BIN to avoid "posix_spawnp failed".
-  // Also strip TMUX env so we don't refuse to nest if the server itself
-  // happens to live inside a tmux session.
+  // Skip `-d` so multiple clients can co-watch. Strip TMUX env so tmux
+  // won't refuse to nest if the server itself runs inside tmux.
   const childEnv = { ...process.env };
   delete childEnv.TMUX;
   delete childEnv.TMUX_PANE;
@@ -368,13 +360,7 @@ wss.on("connection", (ws, req) => {
     term = pty.spawn(
       TMUX_BIN,
       ["attach-session", "-t", rawName],
-      {
-        name: "xterm-256color",
-        cols,
-        rows,
-        cwd: process.env.HOME,
-        env: childEnv,
-      }
+      { name: "xterm-256color", cols, rows, cwd: process.env.HOME, env: childEnv }
     );
   } catch (err) {
     console.error(`pty.spawn failed for ${rawName}:`, err.message);
@@ -385,19 +371,18 @@ wss.on("connection", (ws, req) => {
   term.onData((data) => {
     if (ws.readyState === ws.OPEN) ws.send(data);
   });
-
   term.onExit(() => {
     if (ws.readyState === ws.OPEN) ws.close();
   });
 
   ws.on("message", (msg) => {
-    // Client frames: either raw bytes, or a JSON control message starting with \x01.
+    // Raw bytes, or a JSON control frame prefixed with \x01.
     const str = msg.toString();
     if (str.startsWith("\x01")) {
       try {
         const ctl = JSON.parse(str.slice(1));
         if (ctl.type === "resize") {
-          term.resize(Number(ctl.cols) || cols, Number(ctl.rows) || rows);
+          term.resize(clampSize(ctl.cols, cols), clampSize(ctl.rows, rows));
         }
       } catch {}
       return;
@@ -406,9 +391,7 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
-    try {
-      term.kill();
-    } catch {}
+    try { term.kill(); } catch {}
   });
 });
 

@@ -65,8 +65,8 @@ reason the design holds together.
 - Single file. Imports xterm.js + xterm-addon-fit from jsDelivr.
 - Session drawer with list + "new session" form at top.
 - xterm.js terminal fills the middle.
-- Horizontal quick-action bar: Enter, Esc, y↵, n↵, Ctrl-C, Ctrl-D, ↑/↓,
-  `/clear`, `/compact`. These are the exact keys that are painful on iOS.
+- Horizontal quick-action bar: page-up/down, Enter, Esc, y↵, n↵, Ctrl-C,
+  and arrow keys — the ones that are painful on iOS.
 - Bottom chat-style input: send message + `\r`.
 
 Styling is hand-rolled CSS with a warm dark palette (`--accent: #d97757`,
@@ -84,9 +84,9 @@ Anthropic-ish orange). No Tailwind. No framework.
 ## Common tasks and how to approach them
 
 - **Adding a quick-action button:** edit `#qbar` in `public/index.html`.
-  `data-send` accepts `\r`, `\n`, `\x03`, `\x04`, `\x1b`, `\x1b[A`,
-  `\x1b[B` (the decoder in the click handler is explicit — extend it if
-  you need a new escape).
+  `data-send` accepts `\r`, `\x03`, `\x1b`, and `\x1b[A/B/C/D` (the decoder
+  in the click handler is explicit — extend it if you need a new escape).
+  Use `data-scroll="pageup"` / `pagedown` for scroll buttons.
 - **Adding a new API endpoint:** put it next to the others in
   `server.js`, above the WebSocket section. Validate `name` with
   `/^[a-zA-Z0-9_-]+$/` — tmux names are used in shell args.
