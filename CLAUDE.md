@@ -41,14 +41,13 @@ claude-remote/
   - `POST /api/sessions` — `{ name, cwd }`. Creates
     `tmux new-session -d -s cc-<name> -c <cwd> claude`.
   - `DELETE /api/sessions/:name` — `tmux kill-session`.
-  - `POST /api/ntfy-test` — fires a test ntfy.sh push.
-- WebSocket at `/ws/:name`:
-  - Spawns a fresh pty running `tmux attach-session -t cc-<name>`.
+  - `GET  /login` / `POST /login` — cookie-based password login, only
+    active when `AUTH_PASSWORD` is set.
+- WebSocket at `/ws/:name` (managed) or `/ws-raw/:rawName` (any tmux
+  session):
+  - Spawns a fresh pty running `tmux attach-session -t <rawname>`.
   - Pipes bytes both ways; first byte `\x01` from the client is a JSON
     control frame (currently only `{type:"resize", cols, rows}`).
-- Idle-push: per-session timer re-armed on every byte of output from the
-  pty. If nothing comes out for `IDLE_PING_MS` (default 30s), fire an
-  ntfy.sh notification. Dumb heuristic, but it's good enough — tune later.
 
 ### Why tmux, not raw pty
 
@@ -91,12 +90,10 @@ Anthropic-ish orange). No Tailwind. No framework.
 - **Adding a new API endpoint:** put it next to the others in
   `server.js`, above the WebSocket section. Validate `name` with
   `/^[a-zA-Z0-9_-]+$/` — tmux names are used in shell args.
-- **Changing the idle detector:** `armIdle()` in the WebSocket handler.
-  If you make it smarter (e.g. regex-match Claude's permission prompt),
-  keep the dumb timer as a fallback.
 - **Per-user auth:** the intended path is `tailscale serve` in front and
   reading the `Tailscale-User-Login` header — don't build app-level
-  accounts.
+  accounts. The built-in `AUTH_PASSWORD` cookie login is for "one shared
+  password for my devices", not per-user identity.
 
 ## Non-goals
 
@@ -123,7 +120,6 @@ curl -sX DELETE localhost:8765/api/sessions/smoke
 
 ## Known rough edges (don't "fix" without asking)
 
-- The idle-push is intentionally dumb — see note above.
 - xterm.js on iOS Safari has a finicky soft keyboard. We accept that.
 - No rate limiting. Tailscale is the trust boundary; inside it, Frank
   owns the device.

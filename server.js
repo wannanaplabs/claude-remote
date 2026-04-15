@@ -8,9 +8,12 @@
 //   POST /api/sessions                  -> { name, cwd } create a new session
 //   DELETE /api/sessions/:name          -> kill a session
 //   WS   /ws/:name                      -> bidirectional pty stream (xterm.js)
-//   POST /api/ntfy-test                 -> send a test push
 //
-// Auth: none. Bind to the Tailscale IP so only your tailnet can reach it.
+// Auth: none by default; set AUTH_PASSWORD for cookie-based login.
+// Network: bind to the Tailscale IP so only your tailnet can reach it.
+
+// Load .env first so any config below sees the values.
+require("dotenv").config();
 
 const express = require("express");
 const http = require("http");
@@ -20,17 +23,116 @@ const { execSync, spawnSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const crypto = require("crypto");
+
+// --- macOS boot-time fixups, so `npm start` just works ---
+
+// 1. node-pty's `prebuilds/*/spawn-helper` sometimes extracts without the
+//    execute bit, which causes every pty.spawn to throw "posix_spawnp
+//    failed." Fix it once, idempotently.
+for (const arch of ["darwin-arm64", "darwin-x64"]) {
+  const helper = path.join(__dirname, "node_modules", "node-pty", "prebuilds", arch, "spawn-helper");
+  try {
+    const st = fs.statSync(helper);
+    if (!(st.mode & 0o111)) fs.chmodSync(helper, st.mode | 0o111);
+  } catch {} // file not present for this arch — fine
+}
+
+// 2. node-pty's posix_spawnp is pickier about PATH than Node's own spawn,
+//    so look up the absolute path to tmux if TMUX_BIN wasn't already set.
+function resolveTmuxBin() {
+  if (process.env.TMUX_BIN) return process.env.TMUX_BIN;
+  try {
+    const p = execSync("command -v tmux", { encoding: "utf8", shell: "/bin/bash" }).trim();
+    if (p) return p;
+  } catch {}
+  for (const p of ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]) {
+    if (fs.existsSync(p)) return p;
+  }
+  return "tmux"; // let it fail loudly later
+}
+
+// 3. Default BIND to the Tailscale IP so the listener is only reachable
+//    over the tailnet, not whatever LAN the Mac is on.
+function resolveBind() {
+  if (process.env.BIND) return process.env.BIND;
+  try {
+    const ip = execSync("tailscale ip -4", { encoding: "utf8" }).trim().split("\n")[0];
+    if (ip) return ip;
+  } catch {}
+  return "0.0.0.0";
+}
 
 const PORT = Number(process.env.PORT || 8765);
-const BIND = process.env.BIND || "0.0.0.0"; // set to your tailscale IP for safety
+const BIND = resolveBind();
 const SESSION_PREFIX = process.env.SESSION_PREFIX || "cc-"; // tmux session prefix
 const CLAUDE_CMD = process.env.CLAUDE_CMD || "claude";
 const DEFAULT_CWD = process.env.DEFAULT_CWD || os.homedir();
-const NTFY_TOPIC = process.env.NTFY_TOPIC || ""; // e.g. "claude-frank-9x7q"
-const IDLE_PING_MS = Number(process.env.IDLE_PING_MS || 30_000);
-// Absolute path recommended: node-pty's posix_spawnp doesn't always honour
-// the same PATH Node uses, so "tmux" alone can fail with posix_spawnp error.
-const TMUX_BIN = process.env.TMUX_BIN || "tmux";
+const TMUX_BIN = resolveTmuxBin();
+// Optional password. If set, HTTP and WS both require HTTP Basic Auth with
+// any username and this exact password. iOS Safari caches credentials in
+// Keychain after the first prompt, so the friction is one-time.
+const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "";
+
+// Cookie-based auth: one password field on a login page, server sets a
+// signed cookie valid for a year. HMAC-SHA256 over a fixed string keyed by
+// the password means (a) cookies are stable for a given password so you
+// don't need to re-login on server restart, and (b) rotating AUTH_PASSWORD
+// invalidates every outstanding cookie.
+const AUTH_COOKIE_NAME = "cr_auth";
+const authToken = AUTH_PASSWORD
+  ? crypto.createHmac("sha256", AUTH_PASSWORD).update("claude-remote").digest("hex")
+  : "";
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const pair of header.split(";")) {
+    const idx = pair.indexOf("=");
+    if (idx < 0) continue;
+    out[pair.slice(0, idx).trim()] = decodeURIComponent(pair.slice(idx + 1).trim());
+  }
+  return out;
+}
+
+function checkAuth(req) {
+  if (!AUTH_PASSWORD) return true;
+  const cookie = parseCookies(req.headers.cookie)[AUTH_COOKIE_NAME];
+  if (!cookie) return false;
+  const a = Buffer.from(cookie, "utf8");
+  const b = Buffer.from(authToken, "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function checkPassword(password) {
+  if (!AUTH_PASSWORD) return true;
+  const a = Buffer.from(password || "", "utf8");
+  const b = Buffer.from(AUTH_PASSWORD, "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+const LOGIN_PAGE = `<!doctype html>
+<html><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>claude-remote — sign in</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0d10;color:#e6e6e6;font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif}
+  body{display:flex;align-items:center;justify-content:center}
+  form{background:#15181d;border:1px solid #262a31;border-radius:12px;padding:22px;width:min(92vw,320px)}
+  h1{margin:0 0 14px;font-size:16px;color:#d97757}
+  input{width:100%;box-sizing:border-box;background:#0b0d10;color:#e6e6e6;border:1px solid #262a31;border-radius:8px;padding:12px;font-size:15px;margin-bottom:10px}
+  button{width:100%;background:#d97757;color:#111;border:0;border-radius:8px;padding:12px;font-weight:600;font-size:15px}
+  .err{color:#e05555;font-size:13px;margin:0 0 10px;min-height:1em}
+</style></head>
+<body><form method="POST" action="/login" autocomplete="on">
+<h1>claude-remote</h1>
+<p class="err">__ERR__</p>
+<input type="password" name="password" placeholder="Password"
+  autofocus autocomplete="current-password" />
+<button type="submit">Sign in</button>
+</form></body></html>`;
 
 // ---------- tmux helpers ----------
 
@@ -130,21 +232,6 @@ function killSession(name) {
   tmux(["kill-session", "-t", rawName], { allowFail: true });
 }
 
-// ---------- ntfy push ----------
-
-async function ntfyPush(title, message) {
-  if (!NTFY_TOPIC) return;
-  try {
-    await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
-      method: "POST",
-      headers: { Title: title, Tags: "robot_face", Priority: "default" },
-      body: message,
-    });
-  } catch (e) {
-    console.warn("ntfy push failed:", e.message);
-  }
-}
-
 // ---------- HTTP ----------
 
 const app = express();
@@ -153,6 +240,37 @@ app.use(express.json());
 app.use((req, _res, next) => {
   console.log(`[http] ${req.method} ${req.url} ua="${(req.headers["user-agent"]||"").slice(0,60)}"`);
   next();
+});
+// Form-urlencoded for the login POST.
+app.use(express.urlencoded({ extended: false }));
+
+// Public login routes — no auth required for these.
+app.get("/login", (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.status(200).send(LOGIN_PAGE.replace("__ERR__", ""));
+});
+app.post("/login", (req, res) => {
+  const pw = (req.body && req.body.password) || "";
+  if (!checkPassword(pw)) {
+    res.set("Cache-Control", "no-store");
+    return res.status(401).send(LOGIN_PAGE.replace("__ERR__", "Wrong password"));
+  }
+  res.set(
+    "Set-Cookie",
+    `${AUTH_COOKIE_NAME}=${authToken}; HttpOnly; Path=/; Max-Age=31536000; SameSite=Strict`
+  );
+  res.redirect(302, "/");
+});
+
+// HTTP auth gate for everything else. No-op if AUTH_PASSWORD is unset.
+app.use((req, res, next) => {
+  if (checkAuth(req)) return next();
+  // Browsers hitting HTML paths get redirected to /login.
+  // API/WS clients get 401 JSON.
+  if (req.method === "GET" && (req.path === "/" || req.path.endsWith(".html"))) {
+    return res.redirect(302, "/login");
+  }
+  res.status(401).json({ error: "auth required" });
 });
 // Force-fresh HTML/JS so iOS Safari doesn't serve stale code after edits.
 app.use((req, res, next) => {
@@ -187,22 +305,28 @@ app.delete("/api/sessions/:name", (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/api/ntfy-test", async (_req, res) => {
-  await ntfyPush("claude-remote", "test ping");
-  res.json({ ok: !!NTFY_TOPIC });
-});
-
 // ---------- WebSocket: pipe tmux attach <-> client ----------
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+// Use noServer mode so we fully control when the ws library sees an upgrade.
+// Otherwise the ws library's upgrade listener runs first and writes the 101
+// response before our auth check gets a chance to reject.
+const wss = new WebSocketServer({ noServer: true });
 
-// Track idle-timer per session so we only ping once per "waiting" period.
-const idleTimers = new Map();
-
-// Log WS upgrade attempts before they reach the `connection` handler.
-server.on("upgrade", (req, _socket, _head) => {
+server.on("upgrade", (req, socket, head) => {
   console.log(`[ws] upgrade ${req.url} from ${req.socket.remoteAddress}`);
+  if (!checkAuth(req)) {
+    console.log(`[ws] upgrade denied: auth failed`);
+    socket.write(
+      "HTTP/1.1 401 Unauthorized\r\n" +
+      "Connection: close\r\n\r\n"
+    );
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
 });
 
 wss.on("connection", (ws, req) => {
@@ -258,19 +382,8 @@ wss.on("connection", (ws, req) => {
     return ws.close(1011, "pty spawn failed");
   }
 
-  const armIdle = () => {
-    if (idleTimers.has(name)) clearTimeout(idleTimers.get(name));
-    idleTimers.set(
-      name,
-      setTimeout(() => {
-        ntfyPush(`Claude [${name}] may need input`, "Session has been idle.");
-      }, IDLE_PING_MS)
-    );
-  };
-
   term.onData((data) => {
     if (ws.readyState === ws.OPEN) ws.send(data);
-    armIdle();
   });
 
   term.onExit(() => {
@@ -303,5 +416,5 @@ server.listen(PORT, BIND, () => {
   console.log(`claude-remote listening on http://${BIND}:${PORT}`);
   console.log(`  session prefix: ${SESSION_PREFIX}`);
   console.log(`  default cwd:    ${DEFAULT_CWD}`);
-  console.log(`  ntfy topic:     ${NTFY_TOPIC || "(disabled)"}`);
+  console.log(`  auth:           ${AUTH_PASSWORD ? "cookie (AUTH_PASSWORD set)" : "DISABLED"}`);
 });

@@ -13,8 +13,6 @@ from your phone over Tailscale. Each "chat" is a `tmux` session running
 - Quick-action buttons for things that are a pain to type on a phone:
   `Enter`, `Esc`, `y↵`, `n↵`, `Ctrl-C`, `Ctrl-D`, arrows, `/clear`, `/compact`
 - A plain text box that sends the message + Enter (chat-app feel)
-- Idle-push notifications via [ntfy.sh](https://ntfy.sh) when a session
-  has gone quiet (useful when an agentic run is waiting on your approval)
 
 ## Prereqs
 
@@ -38,43 +36,63 @@ npm install
 `node-pty` builds a native module; if it complains, `xcode-select --install`
 once and retry.
 
-### macOS gotcha: `spawn-helper` executable bit
-
-On Apple Silicon + Node 22, `npm install` may extract
-`node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper` without the
-execute bit. The symptom is every WebSocket attach crashing the Node process
-with `posix_spawnp failed.` One-liner fix (re-run after any `npm install`):
-
-```bash
-chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper
-```
-
-If `tmux` isn't on node-pty's `posix_spawnp` PATH (Homebrew on
-`/opt/homebrew/bin` is the usual culprit), pass the absolute path:
-
-```bash
-TMUX_BIN=/opt/homebrew/bin/tmux npm start
-```
 
 ## Run
-
-Easiest: bind to all interfaces on your tailnet (still private because only
-your tailnet can route to it):
 
 ```bash
 npm start
 ```
 
-Safer: bind only to the Tailscale IP so even if the Mac is on a coffee-shop
-Wi-Fi, the listener isn't reachable from that LAN.
+On macOS the server auto-fixes the usual setup hiccups at boot:
 
-```bash
-TS_IP=$(tailscale ip -4 | head -1)
-BIND=$TS_IP npm start
-```
+- restores `chmod +x` on `node_modules/node-pty/prebuilds/*/spawn-helper`
+  if npm stripped it (otherwise `pty.spawn` throws `posix_spawnp failed`);
+- resolves `tmux`'s absolute path, since node-pty's `posix_spawnp` doesn't
+  always honour Homebrew's `PATH`;
+- defaults `BIND` to your Tailscale IP if `tailscale` is on `PATH`, so the
+  listener is only reachable over the tailnet.
+
+Override anything via env vars or a `.env` file — see the config table below.
 
 Then on your phone: open `http://<your-mac-name>:8765`
 (e.g. `http://franks-macbook:8765` — Tailscale's MagicDNS gives you the name).
+
+### Adding a password (recommended)
+
+Tailscale is already a real trust boundary, but a one-line password adds a
+second factor so that a compromised tailnet member can't silently drive
+your Claude session. Two equivalent ways to set it:
+
+```bash
+# 1. Inline
+AUTH_PASSWORD='pick-a-long-random-string' npm start
+
+# 2. .env file (preferred for persistent setups)
+cp .env.example .env
+$EDITOR .env                    # fill in AUTH_PASSWORD
+npm start                       # dotenv loads .env automatically
+```
+
+The `.env` file is gitignored, so it won't leak into version control.
+
+On first visit you'll land on a simple `/login` page with a single password
+field (no username). Submit it once; the server sets a year-long HttpOnly
+cookie and you're never asked again on that device. iOS Safari offers to
+save the password in iCloud Keychain too, so the one-time entry is really
+one tap.
+
+Implementation details:
+
+- The cookie value is `HMAC-SHA256(password, "claude-remote")`, so it's
+  stable across server restarts (no need to re-login when you restart the
+  server) but invalidates automatically the moment you rotate
+  `AUTH_PASSWORD`.
+- Password comparisons use `crypto.timingSafeEqual`, so there's no timing
+  leak.
+- If the cookie ever stops validating (rotated password, cleared cookies),
+  the web app redirects to `/login` automatically.
+- If `AUTH_PASSWORD` is empty/unset, auth is disabled and the server logs
+  `auth: DISABLED` on startup.
 
 ### Optional: keep it running
 
@@ -92,13 +110,8 @@ since the whole thing is tmux anyway.
 | `SESSION_PREFIX` | `cc-`             | tmux name prefix (so it won't list your other tmux) |
 | `CLAUDE_CMD`     | `claude`          | Command to run inside each new session              |
 | `DEFAULT_CWD`    | `$HOME`           | Used when "New session" leaves cwd blank            |
-| `NTFY_TOPIC`     | *(empty)*         | Your private ntfy.sh topic, e.g. `claude-frank-9x7q`. If empty, push is off. |
-| `IDLE_PING_MS`   | `30000`           | How long of "no output" before a push fires        |
 | `TMUX_BIN`       | `tmux`            | Absolute path to tmux if node-pty can't find it (e.g. `/opt/homebrew/bin/tmux`) |
-
-For ntfy: install the ntfy app on your phone, subscribe to whatever topic
-name you pick (make it random, it's unauthenticated), then set
-`NTFY_TOPIC=that-same-name` when starting the server.
+| `AUTH_PASSWORD`  | *(empty)*         | If set, HTTP and WebSocket require the cookie-based login. Leave empty to disable. |
 
 ## Recommended host setup
 
@@ -120,38 +133,58 @@ Apply without restart: `tmux source-file ~/.tmux.conf`.
 
 ### VS Code: auto-wrap every integrated terminal in tmux
 
-Add to `~/Library/Application Support/Code/User/settings.json`:
+Two profiles, so you can pick reattach vs fresh-per-terminal behavior:
 
-```json
-{
-  "terminal.integrated.profiles.osx": {
-    "claude-tmux": {
-      "path": "/opt/homebrew/bin/tmux",
-      "args": [
-        "new-session",
-        "-A",
-        "-s", "cc-${workspaceFolderBasename}"
-      ],
-      "icon": "terminal-tmux"
-    }
-  },
-  "terminal.integrated.defaultProfile.osx": "claude-tmux"
-}
-```
+- **`claude-tmux`** — reattaches to a single `cc-<workspace>` session every
+  time. Good when you want VS Code to "resume" what you had running.
+- **`claude-tmux-new`** — each new terminal starts a fresh numbered session
+  (`cc-<workspace>-1`, `-2`, `-3`, …), so every `+` in the terminal tab bar
+  is an independent tmux session that also shows up as its own row on the
+  phone.
 
-What this does:
+1. Save this helper as `~/bin/cc-tmux-new` and `chmod +x` it:
 
-- Every new integrated terminal auto-attaches to `cc-<workspace>` (the `-A`
-  flag = attach-if-exists, create-if-not — idempotent). Re-opening VS Code
-  reattaches to the same tmux session, scrollback intact.
-- Because the name starts with `cc-`, `claude-remote` lists it as a
-  "managed" session on your phone, and the Kill button works.
-- Multiple terminals in the same workspace share one tmux session; use
-  tmux's own windows/panes (`Ctrl-b c`, `Ctrl-b "`) for splits — those show
-  up on the phone too.
+   ```bash
+   #!/usr/bin/env bash
+   set -euo pipefail
+   TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+   base="cc-${1:-$(basename "$PWD")}"
+   n=1
+   while "$TMUX_BIN" has-session -t "${base}-${n}" 2>/dev/null; do
+     n=$((n + 1))
+   done
+   exec "$TMUX_BIN" new-session -s "${base}-${n}"
+   ```
+
+2. Add to `~/Library/Application Support/Code/User/settings.json`:
+
+   ```json
+   {
+     "terminal.integrated.profiles.osx": {
+       "claude-tmux": {
+         "path": "/opt/homebrew/bin/tmux",
+         "args": ["new-session", "-A", "-s", "cc-${workspaceFolderBasename}"],
+         "icon": "terminal-tmux"
+       },
+       "claude-tmux-new": {
+         "path": "/Users/YOUR_USER/bin/cc-tmux-new",
+         "args": ["${workspaceFolderBasename}"],
+         "icon": "terminal-tmux"
+       }
+     },
+     "terminal.integrated.defaultProfile.osx": "claude-tmux-new"
+   }
+   ```
+
+Pick which one you want as the default. With `claude-tmux-new` as default,
+every `+` creates a new numbered session — very simple mental model, and
+every terminal becomes a separate row on your phone. The tradeoff is that
+reopening VS Code creates a new session instead of reattaching (use the
+terminal dropdown → `claude-tmux` when you specifically want to reattach).
 
 Use the absolute tmux path (`/opt/homebrew/bin/tmux`) since VS Code's GUI
-launch doesn't always pick up Homebrew's `PATH`.
+launch doesn't always pick up Homebrew's `PATH`. Replace `YOUR_USER` with
+your macOS username.
 
 ## How it works
 
@@ -167,15 +200,16 @@ launch doesn't always pick up Homebrew's `PATH`.
 
 ## Security notes
 
-- There's no app-level auth. The assumption is that `BIND` keeps the
-  listener inside your tailnet. Don't expose port 8765 to the public
-  internet.
-- Anyone on your tailnet who reaches the port can drive any session and
-  run shell commands (Claude can run shell). That's already the trust model
-  for SSH to your Mac, but worth naming.
-- If you want per-user auth, front it with
+- Layer 1 — network: `BIND` to the Tailscale IP keeps the listener inside
+  your tailnet. Don't expose port 8765 to the public internet.
+- Layer 2 — password: set `AUTH_PASSWORD` for HTTP Basic Auth on every
+  request and WS upgrade (constant-time compare, no timing leak). Prevents
+  a compromised tailnet member from silently driving a Claude session.
+- Layer 3 — per-user identity: front it with
   [`tailscale serve`](https://tailscale.com/kb/1242/tailscale-serve) and
-  read the `Tailscale-User-Login` header.
+  read the `Tailscale-User-Login` header if you want actual identity.
+- Anyone who gets past all three can run shell commands (Claude can run
+  shell). That's the same trust model as SSH to your Mac.
 
 ## Known rough edges
 
