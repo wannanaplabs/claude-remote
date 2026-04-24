@@ -46,6 +46,7 @@
   }
   header button:active { background: #2a2f37; }
   #reconnectBtn { font-size: 16px; padding: 4px 10px; line-height: 1; }
+  #killBtn { font-size: 16px; padding: 4px 10px; line-height: 1; color: var(--danger); }
 
   /* Session picker drawer */
   #drawer {
@@ -139,6 +140,7 @@
     <button id="openDrawer">Sessions</button>
     <div class="title" id="activeName">No session</div>
     <button id="reconnectBtn" title="Force reconnect" style="display:none">↻</button>
+    <button id="killBtn" title="Kill this session" style="display:none">×</button>
     <span class="pill" id="connDot">•</span>
     <button id="logToggle" class="pill" title="Toggle debug log" style="font-size:11px">log</button>
   </header>
@@ -244,6 +246,7 @@ function connect(name, { raw = false } = {}) {
   currentRaw = raw;
   $("activeName").textContent = name;
   $("reconnectBtn").style.display = "inline-block";
+  $("killBtn").style.display = "inline-block";
   setConn("connecting");
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   try { fit.fit(); } catch {}
@@ -322,6 +325,23 @@ $("reconnectBtn").addEventListener("click", () => {
   log("manual reconnect");
   reconnectAttempt = 0;
   connect(current, { raw: currentRaw });
+});
+
+$("killBtn").addEventListener("click", async () => {
+  if (!current) return;
+  if (!confirm(`Kill tmux session "${current}"? This cannot be undone.`)) return;
+  const url = currentRaw
+    ? `/api/sessions-raw/${encodeURIComponent(current)}`
+    : `/api/sessions/${encodeURIComponent(current)}`;
+  const r = await fetch(url, { method: "DELETE" });
+  if (!r.ok) { alert(`Kill failed (${r.status})`); return; }
+  log(`killed ${current}`);
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  current = null;
+  if (ws) { try { ws.close(); } catch {} }
+  $("activeName").textContent = "No session";
+  $("reconnectBtn").style.display = "none";
+  $("killBtn").style.display = "none";
 });
 
 // Size the body from visualViewport.height — the true ex-keyboard height
@@ -466,7 +486,7 @@ function renderRow(s) {
       <div class="name">${escapeHtml(s.name)}</div>
       <div class="cwd">${escapeHtml(subtitle)}</div>
     </div>
-    ${s.managed ? `<button class="kill" data-kill="1">Kill</button>` : ""}
+    <button class="kill" data-kill="1">Kill</button>
   `;
   row.addEventListener("click", (ev) => {
     if (ev.target.matches("[data-kill]")) return;
@@ -474,14 +494,24 @@ function renderRow(s) {
     connect(s.managed ? s.name : s.rawName, { raw: !s.managed });
   });
   const killBtn = row.querySelector("[data-kill]");
-  if (killBtn) {
-    killBtn.addEventListener("click", async (ev) => {
-      ev.stopPropagation();
-      if (!confirm(`Kill session "${s.name}"?`)) return;
-      await fetch(`/api/sessions/${encodeURIComponent(s.name)}`, { method: "DELETE" });
-      refresh();
-    });
-  }
+  killBtn.addEventListener("click", async (ev) => {
+    ev.stopPropagation();
+    const label = s.managed ? s.name : s.rawName;
+    if (!confirm(`Kill tmux session "${label}"? This cannot be undone.`)) return;
+    const url = s.managed
+      ? `/api/sessions/${encodeURIComponent(s.name)}`
+      : `/api/sessions-raw/${encodeURIComponent(s.rawName)}`;
+    const r = await fetch(url, { method: "DELETE" });
+    if (!r.ok) alert(`Kill failed (${r.status})`);
+    if (current === (s.managed ? s.name : s.rawName)) {
+      current = null;
+      $("activeName").textContent = "No session";
+      $("reconnectBtn").style.display = "none";
+      $("killBtn").style.display = "none";
+      if (ws) { try { ws.close(); } catch {} }
+    }
+    refresh();
+  });
   return row;
 }
 
