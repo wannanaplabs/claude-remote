@@ -40,7 +40,10 @@ claude-remote/
     `SESSION_PREFIX` (default `cc-`). Strips the prefix in the response.
   - `POST /api/sessions` — `{ name, cwd }`. Creates
     `tmux new-session -d -s cc-<name> -c <cwd> claude`.
-  - `DELETE /api/sessions/:name` — `tmux kill-session`.
+  - `DELETE /api/sessions/:name` — kills a managed (`cc-`-prefixed) session.
+  - `DELETE /api/sessions-raw/:rawName` — kills any tmux session by exact
+    name. Used by the drawer's Kill button for unmanaged rows. Validates
+    rawName with `/^[a-zA-Z0-9_.\-]+$/` before passing to tmux.
   - `GET  /login` / `POST /login` — cookie-based password login, only
     active when `AUTH_PASSWORD` is set.
 - WebSocket at `/ws/:name` (managed) or `/ws-raw/:rawName` (any tmux

@@ -310,6 +310,18 @@ app.delete("/api/sessions/:name", (req, res) => {
   res.json({ ok: true });
 });
 
+// Kill any tmux session by its exact name. Separate from the managed-session
+// endpoint so arbitrary kills are always explicit in the call site.
+app.delete("/api/sessions-raw/:rawName", (req, res) => {
+  if (!sameOrigin(req)) return res.status(403).json({ error: "bad origin" });
+  const rawName = req.params.rawName;
+  if (!/^[a-zA-Z0-9_.\-]+$/.test(rawName)) {
+    return res.status(400).json({ error: "invalid name" });
+  }
+  tmux(["kill-session", "-t", rawName], { allowFail: true });
+  res.json({ ok: true });
+});
+
 // ---------- WebSocket ----------
 
 const server = http.createServer(app);
