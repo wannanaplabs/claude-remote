@@ -1,0 +1,11 @@
+{
+  "terminal": {
+    "shell": {
+      "with_arguments": {
+        "program": "/bin/zsh",
+        "args": ["-lc", "exec ./scripts/zed-claude-tmux"]
+      }
+    },
+    "working_directory": "current_project_directory"
+  }
+}

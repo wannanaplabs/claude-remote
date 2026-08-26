@@ -1,5 +1,5 @@
-// See CLAUDE.md for architecture. tl;dr: HTTP + WS bridge that pipes a
-// `tmux attach` pty through xterm.js on the phone over Tailscale.
+// HTTP + WS bridge that pipes a `tmux attach` pty through xterm.js on the
+// phone over Tailscale. Sessions live in tmux so they survive server restarts.
 
 require("dotenv").config();
 

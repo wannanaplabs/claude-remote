@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_tmux_bin() {
+  if [[ -n "${TMUX_BIN:-}" ]]; then
+    printf '%s\n' "$TMUX_BIN"
+    return
+  fi
+
+  if command -v tmux >/dev/null 2>&1; then
+    command -v tmux
+    return
+  fi
+
+  for candidate in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+
+  printf '%s\n' tmux
+}
+
+sanitize_tmux_name_part() {
+  local value="$1"
+  value="$(printf '%s' "$value" | tr -cs 'A-Za-z0-9_-' '-')"
+  value="${value#-}"
+  value="${value%-}"
+
+  if [[ -z "$value" ]]; then
+    value="zed"
+  fi
+
+  printf '%s\n' "$value"
+}
+
+project_dir="${CLAUDE_UNLOCKED_CWD:-$PWD}"
+project_base="${CLAUDE_UNLOCKED_SESSION_BASE:-$(basename "$project_dir")}"
+session_prefix="${SESSION_PREFIX:-cc-}"
+session_base="$(sanitize_tmux_name_part "$project_base")"
+tmux_bin="$(resolve_tmux_bin)"
+session_cmd="${ZED_TMUX_CMD:-${SHELL:-/bin/zsh}}"
+
+# If Zed inherited a tmux environment, clear it so attaching/nesting works.
+unset TMUX
+unset TMUX_PANE
+
+suffix=1
+while :; do
+  session_name="${session_prefix}${session_base}-${suffix}"
+  if ! "$tmux_bin" has-session -t "$session_name" >/dev/null 2>&1; then
+    break
+  fi
+  suffix=$((suffix + 1))
+done
+
+printf 'Starting Claude Unlocked tmux session: %s\n' "$session_name"
+printf 'Working directory: %s\n\n' "$project_dir"
+
+exec "$tmux_bin" new-session -s "$session_name" -c "$project_dir" "$session_cmd"

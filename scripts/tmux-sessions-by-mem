@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# List tmux sessions ranked by total RSS of their panes' process trees.
+# Heaviest first. RSS double-counts shared pages, so treat as upper bound.
+set -euo pipefail
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux not found in PATH" >&2
+  exit 1
+fi
+
+if ! tmux list-sessions >/dev/null 2>&1; then
+  echo "no tmux server running" >&2
+  exit 0
+fi
+
+{
+  tmux list-panes -a -F 'P #{session_name} #{pane_pid}'
+  ps -A -o pid=,ppid=,rss=
+} | awk '
+  $1 == "P" { pane_session[$3] = $2; next }
+  { rss[$1] = $3; ppid[$1] = $2 }
+  END {
+    for (pid in rss) {
+      cur = pid
+      while (cur != "" && cur != "1" && !(cur in pane_session)) cur = ppid[cur]
+      if (cur in pane_session) session_rss[pane_session[cur]] += rss[pid]
+    }
+    for (s in session_rss) printf "%d\t%s\n", session_rss[s], s
+  }
+' | sort -rn | awk '{ printf "%8.1f MB  %s\n", $1/1024, $2 }'
